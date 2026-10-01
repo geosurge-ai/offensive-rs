@@ -52,13 +52,13 @@ from. The server closed the connection ten bytes into the body.
 error: http://127.0.0.1:47391/short-body: HTTP 200 OK: response body closed before all bytes were read
 
  ● http://127.0.0.1:47391/short-body
- ├ claude-web-fetch-2.rs:304
+ ├ claude-web-fetch-2.rs:314
  │
  ● HTTP 200 OK
- ├ claude-web-fetch-2.rs:275
+ ├ claude-web-fetch-2.rs:285
  │
  ● response body closed before all bytes were read
- ├ claude-web-fetch-2.rs:275
+ ├ claude-web-fetch-2.rs:285
  ╰ Truncated(10 bytes: "<p>partial")
 ```
 

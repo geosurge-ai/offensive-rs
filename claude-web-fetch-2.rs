@@ -20,7 +20,7 @@
 //! found on every page), 1 if --find searched a whole page without finding
 //! QUOTE, 2 if anything failed, 101 if a worker panicked.
 //!
-//! Environment (Claude mode; a variable that is set must be non-empty UTF-8):
+//! Environment (Claude mode; if set, a variable must be non-empty UTF-8):
 //!   ANTHROPIC_API_KEY  API key; if unset, read from rageveil at $RAGEVEIL_KEY
 //!   RAGEVEIL_KEY       rageveil entry (default: platform.claude.com/api/grim-monolith-key)
 //!   MODEL              model id (default: claude-opus-5-5)
@@ -42,7 +42,7 @@ use offensive_rs::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::process::{Command, ExitCode};
-use std::{num::NonZeroUsize, time::Duration};
+use std::{fmt, num::NonZeroUsize, time::Duration};
 use url::Url;
 
 const USAGE: &str = "usage: claude-web-fetch-2.rs [--verbose] [--find QUOTE] URL [URL...]";
@@ -55,14 +55,24 @@ const MAX_REQUESTS: usize = 5;
 /// Deadlines for a whole request, body included; an API call can take minutes.
 const API_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const PAGE_DEADLINE: Duration = Duration::from_secs(2 * 60);
-const MAX_REPLY_BYTES: usize = 64 << 20;
 /// Only this much of a page is searched; absence from a longer page is unproven.
 const MAX_PAGE_BYTES: usize = 10 << 20;
 const CONTEXT_WORDS: usize = 12;
 
-/// The --find quote, if given, as normalised words (at least one), and the
-/// http(s) URLs to work on (at least one).
-fn parse_args(args: Vec<String>) -> Result<(Option<Vec<String>>, Vec<Url>), Report> {
+/// An http(s) URL, shown as it was given.
+struct Target {
+    given: String,
+    url: Url,
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.given)
+    }
+}
+
+/// The --find quote as normalised words, if given, and the targets; neither empty.
+fn parse_args(args: Vec<String>) -> Result<(Option<Vec<String>>, Vec<Target>), Report> {
     let (mut quote, mut targets) = (None, Vec::new());
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -79,7 +89,9 @@ fn parse_args(args: Vec<String>) -> Result<(Option<Vec<String>>, Vec<Url>), Repo
             }
             _ if arg.starts_with('-') => bail!("unknown option {arg}"),
             _ => match Url::parse(&arg).context_with(|| format!("target is not a URL: {arg}"))? {
-                url if matches!(url.scheme(), "http" | "https") => targets.push(url),
+                url if matches!(url.scheme(), "http" | "https") => {
+                    targets.push(Target { given: arg, url })
+                }
                 _ => bail!("target is not an http(s) URL: {arg}"),
             },
         }
@@ -94,16 +106,15 @@ fn main() -> ExitCode {
     offensive_rs::exit(run())
 }
 
-/// `Err` means nothing was fetched: the arguments or the environment are unusable.
 fn run() -> Result<u8, Report> {
     let (quote, targets) = parse_args(offensive_rs::start(USAGE)?)?;
     // Workers share nothing mutable (each builds its own HTTP agent), so a
     // panic costs only its own target.
     Ok(match &quote {
-        Some(quote) => batch(&targets, JOBS, |url| find(url, quote), report_page),
+        Some(quote) => batch(&targets, JOBS, |target| find(target, quote), report_page),
         None => {
             let claude = Claude::from_env()?;
-            batch(&targets, JOBS, |url| summarise(&claude, url), report_summary)
+            batch(&targets, JOBS, |target| summarise(&claude, target), report_summary)
         }
     })
 }
@@ -171,10 +182,10 @@ struct Turn {
     stop_reason: String,
 }
 
-/// Ask Claude to fetch and summarise `url`. `Ok` is a turn that has text.
-fn summarise(claude: &Claude, url: &Url) -> Result<Turn, Report> {
+/// Ask Claude to summarise the target. `Ok` is a turn that has text.
+fn summarise(claude: &Claude, target: &Target) -> Result<Turn, Report> {
     let agent = http::agent(API_DEADLINE);
-    let prompt = claude.prompt.replace("{url}", url.as_str());
+    let prompt = claude.prompt.replace("{url}", target.url.as_str());
     // The assistant turn so far, as received (to send back) and as read.
     let (mut blocks, mut turn) = (Vec::<Value>::new(), Turn::default());
     for request in 1..=MAX_REQUESTS {
@@ -197,7 +208,7 @@ fn summarise(claude: &Claude, url: &Url) -> Result<Turn, Report> {
             .set("anthropic-beta", "server-side-fallback-2026-07-01")
             .send_json(body);
         let reply: Reply =
-            http::json(sent, MAX_REPLY_BYTES).context_with(|| format!("API request {request}"))?;
+            http::json(sent, 64 << 20).context_with(|| format!("API request {request}"))?;
         for block in &reply.content {
             match Block::deserialize(block).context("malformed block in API reply")? {
                 Block::Text { text } => turn.text += &text,
@@ -221,7 +232,7 @@ fn summarise(claude: &Claude, url: &Url) -> Result<Turn, Report> {
     Err(report!("turn still paused after {MAX_REQUESTS} requests").evidence(turn))
 }
 
-fn report_summary(url: &Url, turn: Turn) -> u8 {
+fn report_summary(target: &Target, turn: Turn) -> u8 {
     let mut out = turn.text;
     if !matches!(turn.stop_reason.as_str(), "end_turn" | "stop_sequence") {
         out += &format!("\n\n[truncated: hit {}]", turn.stop_reason);
@@ -237,11 +248,11 @@ fn report_summary(url: &Url, turn: Turn) -> u8 {
             Fetch::WebFetchToolError { error_code } => format!("\n  error: {error_code}"),
         };
     }
-    println!("# {url}\n\n{out}\n");
+    println!("# {target}\n\n{out}\n");
     if grounded {
         return 0;
     }
-    eprintln!("error: {url}: Claude answered without retrieving any page");
+    eprintln!("error: {target}: Claude answered without retrieving any page");
     FAILED
 }
 
@@ -249,7 +260,6 @@ fn report_summary(url: &Url, turn: Turn) -> u8 {
 struct Page {
     /// Where the request ended up after redirects.
     url: String,
-    /// Cache-related headers, as `name: value` lines.
     cache: Vec<String>,
     verdict: Result<Verdict, Report>,
 }
@@ -262,10 +272,10 @@ enum Verdict {
     Unproven(String),
 }
 
-/// Fetch `url` directly and search it for `quote`.
-fn find(url: &Url, quote: &[String]) -> Result<Page, Report> {
+/// Fetch the target directly and search it for `quote`.
+fn find(target: &Target, quote: &[String]) -> Result<Page, Report> {
     let sent = http::agent(PAGE_DEADLINE)
-        .request_url("GET", url)
+        .request_url("GET", &target.url)
         .set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) claude-web-fetch.rs")
         .set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
         .set("Cache-Control", "no-cache")
@@ -280,7 +290,7 @@ fn find(url: &Url, quote: &[String]) -> Result<Page, Report> {
     Ok(Page { url, cache, verdict })
 }
 
-fn report_page(target: &Url, page: Page) -> u8 {
+fn report_page(target: &Target, page: Page) -> u8 {
     // 1: absent from a page that was searched in full.
     let (status, mut out) = match &page.verdict {
         Ok(Verdict::Found(passage)) => (0, format!("FOUND {passage}")),
@@ -288,7 +298,7 @@ fn report_page(target: &Url, page: Page) -> u8 {
         Ok(Verdict::Unproven(passage)) => (FAILED, format!("UNPROVEN, page cut short {passage}")),
         Err(failure) => (FAILED, format!("NOT SEARCHED: {}.", headline(failure))),
     };
-    if page.url != target.as_str() {
+    if page.url != target.url.as_str() {
         out += &format!("\n\nRedirected to {}.", page.url);
     }
     out += "\n\nCache metadata (response headers):";
@@ -307,8 +317,7 @@ fn report_page(target: &Url, page: Page) -> u8 {
     status
 }
 
-/// Search `html` for the quote: in the visible text, then in the full source
-/// (scripts, JSON payloads and attributes included).
+/// Search `html` for the quote: in the visible text, then in the full source.
 fn search(html: &str, quote: &[String]) -> Verdict {
     let needle = format!(" {} ", quote.join(" "));
     // Escapes are decoded after the markup is stripped, so &lt; can't fabricate tags.
