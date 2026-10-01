@@ -91,6 +91,7 @@ fn direct_checks_preserve_search_evidence_and_incomplete_results() {
     let target = target("https://example.com/page");
     let quote = quote("expected words");
     let page = |body| Page {
+        label: "Direct HTTP",
         url: target.url.to_string(),
         status: 200,
         content_type: "text/html".into(),
@@ -132,7 +133,7 @@ fn cache_requests_keep_identical_prompts_and_separate_conversations() {
 }
 
 #[test]
-fn each_url_starts_three_checks_together_and_one_failure_does_not_stop_them() {
+fn each_url_starts_four_checks_together_and_one_failure_does_not_stop_them() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -141,8 +142,8 @@ fn each_url_starts_three_checks_together_and_one_failure_does_not_stop_them() {
         for round in 0..3 {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut requests = Vec::new();
-            // No response until all three arrive: sequential checks fail this test.
-            while requests.len() < 3 {
+            // No response until all four arrive: sequential checks fail this test.
+            while requests.len() < 4 {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -168,7 +169,7 @@ fn each_url_starts_three_checks_together_and_one_failure_does_not_stop_them() {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             Instant::now() < deadline,
-                            "three concurrent checks did not arrive"
+                            "the four concurrent checks did not arrive"
                         );
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -179,7 +180,8 @@ fn each_url_starts_three_checks_together_and_one_failure_does_not_stop_them() {
             let mut seen = Vec::new();
             for (mut stream, header, body) in requests {
                 let (status, kind, response) = if header.starts_with("GET ") {
-                    seen.push("direct");
+                    let gptbot = header.contains("User-Agent: GPTBot\r\n");
+                    seen.push(if gptbot { "gptbot" } else { "direct" });
                     assert!(header.starts_with(&format!("GET /page/{round} ")));
                     assert!(!header.to_ascii_lowercase().contains("cache-control:"));
                     (
@@ -215,7 +217,7 @@ fn each_url_starts_three_checks_together_and_one_failure_does_not_stop_them() {
                 write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
             }
             seen.sort_unstable();
-            assert_eq!(seen, ["cached", "direct", "fresh"]);
+            assert_eq!(seen, ["cached", "direct", "fresh", "gptbot"]);
         }
     });
     let claude = Ok(claude());

@@ -69,7 +69,7 @@ its owner reports it.
 
 ## The example
 
-[`claude-web-fetch-2.rs`](claude-web-fetch-2.rs) audits each URL with three
+[`claude-web-fetch-2.rs`](claude-web-fetch-2.rs) audits each URL with four
 independent checks, run in parallel:
 
 1. **Direct HTTP:** an ordinary GET, reporting status, content type, a response
@@ -78,15 +78,16 @@ independent checks, run in parallel:
    `web_fetch.use_cache: true`.
 3. **Claude, cache OFF:** asks the same question in a separate conversation,
    with `web_fetch.use_cache: false`.
+4. **GPTBot:** the direct GET again, sent with `User-Agent: GPTBot`.
 
-Results are grouped under each URL in that order. All three checks finish
+Results are grouped under each URL in that order. All four checks finish
 before the next URL starts. There is no URL worker pool or jobs setting. A
 failure in one check does not suppress the others. Each request, and the
 command that fetches the API key, is a `step`: its progress lines on stderr
 name the URL and the check, so a slow or stuck check can be told from the
 other two.
 
-`--find QUOTE` applies to **all three checks**. Claude is asked whether the
+`--find QUOTE` applies to **all four checks**. Claude is asked whether the
 quote occurs; the program also searches the actual text returned by
 `web_fetch`, independently of Claude's answer. A quote echoed in the answer
 does not establish a match. The direct HTTP body and the two Claude
@@ -147,6 +148,6 @@ cargo run --features ureq --example claude-web-fetch -- --verbose https://exampl
 
 `cargo test --all-features` runs the library and auditor tests. The auditor
 tests live in [`claude-web-fetch-2-tests.rs`](claude-web-fetch-2-tests.rs) and
-use a local HTTP server, including a check that all three requests
+use a local HTTP server, including a check that all four requests
 arrive before any response is released; they make no live Claude calls.
 `nix develop` (or direnv) provides cargo, rustc, rustfmt, clippy and rust-script.

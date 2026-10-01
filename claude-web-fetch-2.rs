@@ -1,9 +1,9 @@
 #!/usr/bin/env rust-script
-//! Audit each URL three ways: ordinary HTTP, Claude web_fetch with its cache
-//! enabled, and Claude web_fetch with its cache bypassed. The three checks
+//! Audit each URL four ways: ordinary HTTP, Claude web_fetch with its cache
+//! enabled and with it bypassed, and ordinary HTTP as GPTBot. The four checks
 //! run concurrently for one URL; all finish before the next URL starts.
 //!
-//! With --find, all three checks look for QUOTE. Claude is asked to check it,
+//! With --find, all four checks look for QUOTE. Claude is asked to check it,
 //! and the returned web_fetch text is searched independently of its answer.
 //! Matching ignores case, punctuation and whitespace. Direct HTML is searched
 //! both as stripped text and full source, decoding HTML/JSON escapes. Each
@@ -14,7 +14,7 @@
 //! Progress is a line on stderr as each request starts and ends, unless
 //! --quiet. A failure is one line on stderr; --verbose adds the whole report,
 //! and RUST_BACKTRACE=1 backtraces. Exit status: 0 on success (--find: QUOTE
-//! found in all three checks), 1 if a search did not find QUOTE, 2 if a check
+//! found in all four checks), 1 if a search did not find QUOTE, 2 if a check
 //! failed or was incomplete, 101 if a check panicked. The highest status wins.
 //!
 //! Environment (if set, a variable must be non-empty UTF-8):
@@ -44,10 +44,10 @@ use url::Url;
 
 const USAGE: &str = "\
     usage: claude-web-fetch-2.rs [--quiet] [--verbose] [--find QUOTE] URL [URL...]\n\n\
-    Audit each URL with three parallel checks: direct HTTP, Claude cache ON, Claude cache OFF.\n\
-    --find QUOTE checks for the quote in all three results.\n\
+    Audit each URL with four parallel checks: direct HTTP, Claude cache ON, cache OFF, GPTBot HTTP.\n\
+    --find QUOTE checks for the quote in all four results.\n\
     --quiet omits the progress lines on stderr.\n\
-    Results are grouped per URL; the next URL starts after all three checks finish.";
+    Results are grouped per URL; the next URL starts after all four checks finish.";
 const DEFAULT_PROMPT: &str = "Fetch {url} with web_fetch and describe what this URL returns: \
     its title, author, date, main content and concrete conclusions, where available.";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -123,7 +123,7 @@ fn run() -> Result<u8, Report> {
     Ok(worst)
 }
 
-/// Exactly three independent checks of this URL, reported in a stable order.
+/// Exactly four independent checks of this URL, reported in a stable order.
 fn audit(
     target: &Target,
     quote: Option<&Quote>,
@@ -133,9 +133,8 @@ fn audit(
     println!("# {target}\n");
     thread::scope(|scope| {
         // Each check's progress is reported under the target and the check's name.
-        let direct = scope.spawn(|| {
-            under(format!("{target}: Direct HTTP"), || step("GET", || fetch_page(target)))
-        });
+        let direct = scope.spawn(|| fetch(target, "Direct HTTP", None));
+        let gptbot = scope.spawn(|| fetch(target, "GPTBot", Some("GPTBot")));
         let ask = |label, use_cache| {
             let worker = claude.as_ref().ok().map(|claude| {
                 let turn = move || ask_claude(claude, target, quote, use_cache, api_url);
@@ -161,7 +160,9 @@ fn audit(
             };
             worst = worst.max(status);
         }
-        worst
+        worst.max(show_check(target, "GPTBot", gptbot.join(), |page| {
+            report_page(target, page, quote)
+        }))
     })
 }
 
@@ -413,6 +414,8 @@ fn same_url(given: &str, target: &Url) -> bool {
 
 /// A response to a direct fetch, error statuses included.
 struct Page {
+    /// The check that fetched it.
+    label: &'static str,
     /// Where the request ended up after redirects.
     url: String,
     status: u16,
@@ -429,11 +432,16 @@ enum Verdict {
     Unproven(String),
 }
 
+/// A direct check, as a browser unless `agent` is given, reported under its name.
+fn fetch(target: &Target, label: &'static str, agent: Option<&str>) -> Result<Page, Report> {
+    under(format!("{target}: {label}"), || step("GET", || fetch_page(target, label, agent)))
+}
+
 /// Ordinary HTTP fetch, independent of either Claude conversation.
-fn fetch_page(target: &Target) -> Result<Page, Report> {
+fn fetch_page(target: &Target, label: &'static str, agent: Option<&str>) -> Result<Page, Report> {
     let sent = http::agent(PAGE_DEADLINE)
         .request_url("GET", &target.url)
-        .set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) claude-web-fetch.rs")
+        .set("User-Agent", agent.unwrap_or("Mozilla/5.0 (X11; Linux x86_64) claude-web-fetch.rs"))
         .set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
         .call();
     let resp = http::arrived(sent)?;
@@ -441,7 +449,7 @@ fn fetch_page(target: &Target) -> Result<Page, Report> {
     let status = resp.status();
     let content_type = resp.header("content-type").unwrap_or("unknown").to_owned();
     let body = http::body(resp, MAX_PAGE_BYTES);
-    Ok(Page { url, status, content_type, cache, body })
+    Ok(Page { label, url, status, content_type, cache, body })
 }
 
 fn report_verdict(verdict: &Verdict) -> (u8, String) {
@@ -478,7 +486,7 @@ fn report_page(target: &Target, page: Page, quote: Option<&Quote>) -> (u8, Strin
         }
         Err(failure) => {
             out += &format!("\nFAILED: {}", headline(&failure));
-            complain(&failure.context(format!("{target}: Direct HTTP")));
+            complain(&failure.context(format!("{target}: {}", page.label)));
             FAILED
         }
     };
