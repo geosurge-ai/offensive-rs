@@ -29,3 +29,4 @@ url = "2"
 name = "claude-web-fetch"
 path = "claude-web-fetch-2.rs"
 required-features = ["ureq"]
+test = true

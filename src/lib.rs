@@ -14,6 +14,11 @@
 //! [`start`] saw `RUST_BACKTRACE`. [`complain`] prints the first, and the
 //! second too for a reader who passed `--verbose`.
 //!
+//! A run that hangs or is killed returns no report. [`step`] therefore says on
+//! stderr what is about to be waited for, and how it ended, once [`start`] has
+//! run and unless the reader passed `--quiet`. The step's name is also the
+//! layer a failure in it gets.
+//!
 //! ```
 //! use offensive_rs::{headline, Captured, Evidence, Report, ResultExt};
 //!
@@ -30,7 +35,7 @@
 //! ```
 
 use rootcause::{
-    ReportRef,
+    IntoReportCollection, ReportRef,
     handlers::AttachmentHandler,
     hooks::Hooks,
     markers::{Dynamic, SendSync},
@@ -39,14 +44,17 @@ use rootcause_backtrace::BacktraceCollector;
 use std::{
     any::Any,
     borrow::Cow,
+    cell::RefCell,
     env,
     ffi::OsString,
     fmt,
-    io::{self, Read},
+    io::{self, Read, Write},
+    mem,
     num::NonZeroUsize,
     process::{Command, ExitCode},
     sync::atomic::{AtomicBool, Ordering},
     thread,
+    time::Instant,
 };
 
 pub use rootcause::{self, Report, bail, prelude::ResultExt, report};
@@ -59,13 +67,15 @@ pub const FAILED: u8 = 2;
 pub const DEFECT: u8 = 101;
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
+static PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Call first in `main`. Returns the command-line arguments after the program
-/// name, minus the two flags handled here: `--verbose` makes [`complain`]
-/// print whole reports, and `-h` or `--help` prints `usage` and exits.
-/// (`std::env::args` panics on an argument that is not UTF-8; this reports
-/// it.) When `RUST_BACKTRACE` is set (and not `0`), every report layer
-/// captures a backtrace. Source locations are captured regardless.
+/// name, minus the three flags handled here: `--verbose` makes [`complain`]
+/// print whole reports, `--quiet` keeps each [`step`] from being announced
+/// (from here on it is, otherwise), and `-h` or `--help` prints `usage` and
+/// exits. (`std::env::args` panics on an argument that is not UTF-8; this
+/// reports it.) When `RUST_BACKTRACE` is set (and not `0`), every report
+/// layer captures a backtrace. Source locations are captured regardless.
 pub fn start(usage: &str) -> Result<Vec<String>, Report> {
     if env::var_os("RUST_BACKTRACE").is_some_and(|value| value != "0") {
         // Err means the program installed its own rootcause hooks; those stand.
@@ -77,6 +87,7 @@ pub fn start(usage: &str) -> Result<Vec<String>, Report> {
         std::process::exit(0);
     }
     VERBOSE.store(flags.contains(&"--verbose"), Ordering::Relaxed);
+    PROGRESS.store(!flags.contains(&"--quiet"), Ordering::Relaxed);
     Ok(args)
 }
 
@@ -88,6 +99,7 @@ fn split_flags(
     for arg in args {
         match arg.into_string() {
             Ok(arg) if arg == "--verbose" => flags.push("--verbose"),
+            Ok(arg) if arg == "--quiet" => flags.push("--quiet"),
             Ok(arg) if arg == "--help" || arg == "-h" => flags.push("--help"),
             Ok(arg) => rest.push(arg),
             Err(arg) => bail!("argument is not UTF-8: {arg:?}"),
@@ -147,6 +159,61 @@ pub fn exit(status: Result<u8, Report>) -> ExitCode {
         complain(&failure);
         FAILED
     }))
+}
+
+thread_local! {
+    /// What this thread's [`step`]s are part of: each heading it is [`under`],
+    /// outermost first, each followed by `: `.
+    static UNDER: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Runs `work` as a step that may block, saying so on stderr once [`start`]
+/// has run without `--quiet`: `started: NAME` before it, then `finished in
+/// 1.2s: NAME`, or `failed after 1.2s: ` and the failure's [`headline`]. A run
+/// that hangs or is killed returns no report, and these lines are what is
+/// left of it. The failure gets `name` as a layer, and steps inside this one
+/// are reported [`under`] it. Never put a credential in a name.
+#[track_caller]
+pub fn step<T, E: IntoReportCollection<SendSync>>(
+    name: impl fmt::Display,
+    work: impl FnOnce() -> Result<T, E>,
+) -> Result<T, Report> {
+    let (outer, name) = (UNDER.with_borrow(String::clone), name.to_string());
+    tell(format_args!("started: {outer}{name}"));
+    // ponytail: says nothing while `work` waits; a ticker thread would show
+    // that the run is still alive.
+    let began = Instant::now();
+    let result = under(&name, work).context_with(|| name.clone());
+    let took = began.elapsed().as_secs_f64();
+    match &result {
+        Ok(_) => tell(format_args!("finished in {took:.1}s: {outer}{name}")),
+        Err(failure) => tell(format_args!("failed after {took:.1}s: {outer}{}", headline(failure))),
+    }
+    Ok(result?)
+}
+
+/// Runs `work` with `heading` in front of the progress lines of the [`step`]s
+/// it takes on this thread, as when several workers report at once. It prints
+/// nothing itself, and leaves a failure as it is.
+pub fn under<T>(heading: impl fmt::Display, work: impl FnOnce() -> T) -> T {
+    struct Restore(String);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNDER.set(mem::take(&mut self.0));
+        }
+    }
+    let inner = format!("{}{heading}: ", UNDER.with_borrow(String::clone));
+    let _outer = Restore(UNDER.replace(inner));
+    work()
+}
+
+/// One line of progress on stderr, written whole so that a line from another
+/// thread, or from stdout, cannot land inside it. A line that cannot be
+/// written is dropped: a reader that went away does not fail the step.
+fn tell(line: fmt::Arguments<'_>) {
+    if PROGRESS.load(Ordering::Relaxed) {
+        let _ = io::stderr().write_all(format!("{line}\n").as_bytes());
+    }
 }
 
 /// Typed evidence on a report layer: any `Debug` value, shown pretty-printed in
@@ -354,18 +421,22 @@ fn checked(name: &str, raw: Option<OsString>, secret: bool) -> Result<Option<Str
 }
 
 /// A credential from a command that prints it, such as a password manager:
-/// the first line of its stdout. A failure reports the command line, its exit
-/// status and its stderr, never its stdout.
+/// the first line of its stdout. Running it is a [`step`], since it may wait
+/// to be unlocked. Progress and a failure show the command line, a failure
+/// its exit status and its stderr too, and neither its stdout.
 #[track_caller]
 pub fn secret_from(command: &mut Command) -> Result<Secret<String>, Report> {
-    let out = command.output().context_with(|| format!("running {command:?}"))?;
-    if !out.status.success() {
-        bail!("{command:?} ({}): {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
-    }
-    match String::from_utf8(out.stdout).ok().and_then(|s| s.lines().next().map(str::to_owned)) {
-        Some(secret) if !secret.is_empty() => Ok(Secret::new(secret)),
-        _ => bail!("{command:?} printed no secret (an empty or non-UTF-8 first line)"),
-    }
+    step(format!("running {command:?}"), || -> Result<_, Report> {
+        let out = command.output()?;
+        if !out.status.success() {
+            bail!("{}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
+        }
+        let printed = String::from_utf8(out.stdout).ok();
+        match printed.as_deref().and_then(|printed| printed.lines().next()) {
+            Some(secret) if !secret.is_empty() => Ok(Secret::new(secret.to_owned())),
+            _ => bail!("it printed no secret (an empty or non-UTF-8 first line)"),
+        }
+    })
 }
 
 /// A value that must not reach output: `Debug` is redacted and there is no
@@ -631,15 +702,97 @@ mod tests {
     }
 
     #[test]
+    fn step_names_its_failure_and_is_under_the_headings_around_it_on_its_thread() {
+        let under_now = || UNDER.with_borrow(String::clone);
+        assert_eq!(step("parse", || "7".parse::<u8>()).unwrap(), 7);
+
+        let failure = under("page 3", || {
+            step("fetch", || {
+                assert_eq!(under_now(), "page 3: fetch: ");
+                thread::scope(|scope| scope.spawn(|| assert_eq!(under_now(), "")).join()).unwrap();
+                step("read", || Err::<(), _>(io::Error::other("reset")))
+            })
+        })
+        .unwrap_err();
+        assert_eq!(headline(&failure), "fetch: read: reset");
+        assert!(
+            failure.iter_reports().any(|n| n.downcast_current_context::<io::Error>().is_some())
+        );
+
+        assert!(std::panic::catch_unwind(|| under::<()>("broken", || panic!("defect"))).is_err());
+        assert_eq!(under_now(), "", "a heading outlived its work");
+    }
+
+    /// Runs itself in a child process, whose stderr is the progress to check.
+    #[test]
+    fn progress_is_a_line_before_and_after_each_step_unless_quiet() {
+        const CHILD: &str = "OFFENSIVE_RS_PROGRESS_CHILD";
+        if env::var_os(CHILD).is_some() {
+            step("unseen", || "7".parse::<u8>()).unwrap();
+            PROGRESS.store(true, Ordering::Relaxed);
+            let _ = under("page 3", || step("read", || Err::<(), _>(io::Error::other("reset"))));
+            step("parse", || "7".parse::<u8>()).unwrap();
+            if cfg!(unix) {
+                secret_from(Command::new("sh").args(["-c", "printf 'hunt%s\\n' er2"])).unwrap();
+            }
+            return;
+        }
+        let test = "tests::progress_is_a_line_before_and_after_each_step_unless_quiet";
+        let child = Command::new(env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let told = String::from_utf8(child.stderr).unwrap();
+        assert!(child.status.success(), "{told}");
+        let lines: Vec<&str> = told.lines().collect();
+        let Some(&[started, failed, parsing, parsed]) = lines.get(..4) else { panic!("{told}") };
+        assert_eq!((started, parsing), ("started: page 3: read", "started: parse"));
+        // Between its two parts, a line that ends a step says how long it took.
+        let ended = |line: &str, how, what| line.starts_with(how) && line.ends_with(what);
+        assert!(ended(failed, "failed after ", "s: page 3: read: reset"), "{told}");
+        assert!(ended(parsed, "finished in ", "s: parse"), "{told}");
+        // Running a secret's command is a step: two more lines, without what it printed.
+        assert_eq!(lines.len(), if cfg!(unix) { 6 } else { 4 }, "{told}");
+        assert!(!told.contains("hunter2"), "{told}");
+    }
+
+    /// Runs itself in a child process, whose stderr nobody reads.
+    #[test]
+    #[cfg(unix)]
+    fn a_step_does_not_fail_because_nobody_reads_its_progress() {
+        use std::process::Stdio;
+        const CHILD: &str = "OFFENSIVE_RS_UNHEARD_CHILD";
+        if env::var_os(CHILD).is_some() {
+            PROGRESS.store(true, Ordering::Relaxed);
+            // Ends when the parent, having closed this stderr, closes this stdin.
+            assert_eq!(step("wait", || io::read_to_string(io::stdin())).unwrap(), "");
+            return;
+        }
+        let test = "tests::a_step_does_not_fail_because_nobody_reads_its_progress";
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stderr.take());
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success(), "the step failed for want of a reader");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn arguments_and_environment_are_checked_and_a_rejected_secret_is_not_shown() {
         use std::os::unix::ffi::OsStringExt;
         let garbled = || Some(OsString::from_vec(b"hunter\xff".to_vec()));
-        let args = ["--find", "--verbose", "x", "-h"].map(OsString::from);
+        let args = ["--find", "--verbose", "x", "--quiet", "-h"].map(OsString::from);
         let (flags, rest) = split_flags(args.into_iter()).unwrap();
         assert_eq!(
             (flags, rest),
-            (vec!["--verbose", "--help"], vec!["--find".to_owned(), "x".to_owned()])
+            (vec!["--verbose", "--quiet", "--help"], vec!["--find".to_owned(), "x".to_owned()])
         );
         assert!(
             headline(&split_flags(garbled().into_iter()).unwrap_err())
@@ -664,7 +817,7 @@ mod tests {
         assert_eq!(sh("printf 'hunt%s\\nmore\\n' er2").unwrap().expose(), "hunter2");
         let failure = headline(&sh("printf 'hunt%s\\n' er2; echo locked >&2; exit 3").unwrap_err());
         assert!(
-            failure.contains("exit status: 3): locked") && !failure.contains("hunter2"),
+            failure.ends_with(": exit status: 3: locked") && !failure.contains("hunter2"),
             "{failure}"
         );
         assert!(headline(&sh("echo").unwrap_err()).contains("printed no secret"));
