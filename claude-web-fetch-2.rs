@@ -25,7 +25,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! offensive-rs = { git = "https://github.com/geosurge-ai/offensive-rs", features = ["ureq"] }
+//! offensive-rs = { git = "https://github.com/geosurge-ai/offensive-rs", rev = "c2e1a86", features = ["ureq"] }
 //! html-escape = "0.2"
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
