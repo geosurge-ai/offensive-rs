@@ -1,0 +1,31 @@
+[package]
+name = "offensive-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Offensive coding support: evidence-preserving error reports, bounded captures, contained workers"
+repository = "https://github.com/geosurge-ai/offensive-rs"
+publish = false
+
+[features]
+# `offensive_rs::http`, and a re-export of the ureq it is built on.
+ureq = ["dep:ureq", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+rootcause = "0.13"
+rootcause-backtrace = "0.13"
+ureq = { version = "2", features = ["json"], optional = true }
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+html-escape = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+
+# Also runs on its own through rust-script: ./claude-web-fetch-2.rs
+[[example]]
+name = "claude-web-fetch"
+path = "claude-web-fetch-2.rs"
+required-features = ["ureq"]
