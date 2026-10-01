@@ -78,9 +78,10 @@ repository over git, so the file works wherever it is copied to:
 ./claude-web-fetch-2.rs --find 'a quote to look for' https://example.com/page
 ```
 
-rust-script caches the build by the script's contents: after this library
-changes, run it once with `rust-script --force` to pick the change up. From a
-checkout it also runs against the local library:
+rust-script keeps a lockfile for each script, so the library stays at the
+commit the script first built against. To move it, name the commit in the
+script's manifest: `offensive-rs = { git = "…", rev = "…", features = ["ureq"] }`.
+From a checkout the example also runs against the local library:
 
 ```sh
 cargo run --features ureq --example claude-web-fetch -- --verbose https://example.com/page
